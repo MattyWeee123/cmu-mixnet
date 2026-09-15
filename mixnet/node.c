@@ -60,11 +60,29 @@ struct graph {
 };
 
 /**
+ * The path to one destination: Dijkstra's output for it, kept between runs
+ * so that routing a packet is a lookup. The route is in exactly the form the
+ * routing header wants, the intermediate hops only, since the header carries
+ * source and destination itself.
+ *
+ * `reachable` is needed because a direct neighbor and an unreachable node
+ * both have no intermediate hops, so `route == NULL` cannot tell them apart.
+ */
+struct fib_entry {
+    bool reachable;                 // False: no path on the current topology
+    uint16_t route_len;             // Hops strictly between us and the destination
+    mixnet_address *route;          // [route_len], in forwarding order; NULL if none
+};
+
+/**
  * This node's protocol state.
  *
  * Spanning-tree invariant:
  *     root == config.node_addr  <=>  path_len == 0
  *                               <=>  next_hop == INVALID_MIXADDR
+ *
+ * The FIB is derived state: it is rebuilt from the topology whenever the
+ * topology changes, and nothing else ever writes to it.
  */
 struct node_state {
     // Spanning tree (CP1)
@@ -81,6 +99,10 @@ struct node_state {
     // Link state (CP2)
     struct graph topology;          // Global view, assembled from LSAs
     uint64_t lsa_start_ms;          // Last time we advertised our own links
+
+    // Shortest paths (CP2)
+    struct fib_entry *fib;          // [fib_count], parallel to topology.v
+    uint16_t fib_count;             // topology.count as of the last rebuild
 };
 
 /** Monotonic milliseconds; the STP intervals are in ms. */
@@ -103,6 +125,14 @@ static int port_of(const struct mixnet_node_config *c,
     return -1;
 }
 
+/** The vertex id for an address, or -1 if we have never heard of it. */
+static int id_find(const struct graph *g, const mixnet_address addr) {
+    for (uint16_t i = 0; i < g->count; i++) {
+        if (g->v[i].addr == addr) { return (int) i; }
+    }
+    return -1;
+}
+
 /**
  * Find-or-insert: the vertex id for an address, appending a link-less vertex
  * if this is the first time we have seen it. Returns -1 only if we are out
@@ -113,9 +143,9 @@ static int port_of(const struct mixnet_node_config *c,
  * relaxation loop would hit an address with no id.
  */
 static int id_lookup(struct graph *g, const mixnet_address addr) {
-    for (uint16_t i = 0; i < g->count; i++) {
-        if (g->v[i].addr == addr) { return (int) i; }
-    }
+    const int found = id_find(g, addr);
+    if (found >= 0) { return found; }
+
     if (g->count == g->capacity) {
         const uint32_t cap = (g->capacity == 0) ?
             8u : ((uint32_t) g->capacity * 2u);
@@ -301,15 +331,170 @@ static void broadcast_on_tree(void *const handle,
     }
 }
 
+/*
+ * Shortest paths. Dijkstra runs from this node over s->topology whenever the
+ * topology changes, and writes one FIB entry per vertex. Between runs the
+ * data path only reads the FIB; it never computes.
+ *
+ * Linear scans throughout: the network is at most a few hundred nodes, and
+ * this runs a handful of times during the initial LSA burst and then stops,
+ * since a re-advertisement that changes nothing never gets here.
+ */
+
+// Cost of a destination no path has reached yet
+#define INFINITE_COST UINT32_MAX
+
+/** Dijkstra's working state for one vertex; indexed by vertex id. */
+struct sp_vertex {
+    uint32_t cost;              // Cheapest known path from us; INFINITE_COST if none
+    int prev;                   // Vertex id before this one on that path; -1 for us
+    mixnet_address first_hop;   // Our neighbor that path leaves through
+    bool settled;               // Cost is final
+};
+
 /**
- * TODO(CP2 §2): Dijkstra over s->topology, memoized into a FIB. Stubbed for
- * now so the link-state path is already wired to it; see §2 of
- * docs/cp2-lsa-plan.md.
+ * Whether path a beats path b: cheaper, or equal and leaving through a
+ * smaller neighbor address. The second half is the handout's equal-cost
+ * rule. It is also the order vertices are settled in, and that matters when
+ * a link costs zero: a vertex must not be settled while an equal-cost path
+ * with a smaller first hop could still reach it over a zero-cost link from
+ * a vertex that is not settled yet.
+ */
+static bool path_is_better(const uint32_t cost_a,
+                           const mixnet_address first_hop_a,
+                           const uint32_t cost_b,
+                           const mixnet_address first_hop_b) {
+    return (cost_a < cost_b) ||
+           ((cost_a == cost_b) && (first_hop_a < first_hop_b));
+}
+
+/**
+ * Dijkstra from `self` over the topology. Each vertex's advertised links are
+ * its outgoing edges, so asymmetric costs need no special handling. Returns
+ * the per-vertex result, owned by the caller, or NULL if out of memory.
+ */
+static struct sp_vertex *run_dijkstra(const struct graph *g, const int self) {
+    struct sp_vertex *sp = malloc(sizeof(*sp) * g->count);
+    if (sp == NULL) { return NULL; }
+
+    for (uint16_t i = 0; i < g->count; i++) {
+        sp[i] = (struct sp_vertex) { .cost = INFINITE_COST, .prev = -1,
+                                     .first_hop = INVALID_MIXADDR,
+                                     .settled = false };
+    }
+    sp[self].cost = 0;
+
+    for (;;) {
+        // Settle the best vertex that some path has reached
+        int u = -1;
+        for (uint16_t i = 0; i < g->count; i++) {
+            if (sp[i].settled || (sp[i].cost == INFINITE_COST)) { continue; }
+            if ((u < 0) || path_is_better(sp[i].cost, sp[i].first_hop,
+                                          sp[u].cost, sp[u].first_hop)) {
+                u = (int) i;
+            }
+        }
+        if (u < 0) { break; }
+        sp[u].settled = true;
+
+        // Relax its outgoing links. Every link's far end has an id, because
+        // graph_update interns every address an LSA names; a settled far end
+        // cannot be improved, by the settling order above.
+        const struct vertex *from = &g->v[u];
+        for (uint16_t k = 0; k < from->num_links; k++) {
+            const mixnet_lsa_link_params *link = &from->links[k];
+            const int w = id_find(g, link->neighbor_mixaddr);
+            if ((w < 0) || sp[w].settled) { continue; }
+
+            const uint32_t cost = sp[u].cost + link->cost;
+            const mixnet_address first_hop =
+                (u == self) ? link->neighbor_mixaddr : sp[u].first_hop;
+
+            if (path_is_better(cost, first_hop, sp[w].cost, sp[w].first_hop)) {
+                sp[w].cost = cost;
+                sp[w].prev = u;
+                sp[w].first_hop = first_hop;
+            }
+        }
+    }
+    return sp;
+}
+
+/** Discard every FIB entry and size the table for `count` vertices. */
+static bool fib_reset(struct node_state *s, const uint16_t count) {
+    for (uint16_t i = 0; i < s->fib_count; i++) { free(s->fib[i].route); }
+    free(s->fib);
+    s->fib = NULL;
+    s->fib_count = 0;
+
+    if (count == 0) { return true; }
+    if ((s->fib = calloc(count, sizeof(*s->fib))) == NULL) { return false; }
+    s->fib_count = count;  // Zeroed, so every entry starts unreachable
+    return true;
+}
+
+/**
+ * Turn Dijkstra's result for one destination into its FIB entry. The
+ * predecessor chain runs from the destination back to us, so the route is
+ * counted first, then filled from the back.
+ */
+static bool install_route(struct fib_entry *entry, const struct graph *g,
+                          const struct sp_vertex *sp, const int self,
+                          const int dst) {
+
+    uint32_t hops = 0;
+    for (int v = sp[dst].prev; v != self; v = sp[v].prev) { hops++; }
+    if (hops > MAX_MIXNET_ROUTE_LENGTH) { return false; }  // Header cannot carry it
+
+    mixnet_address *route = NULL;
+    if (hops > 0) {
+        if ((route = malloc(sizeof(*route) * hops)) == NULL) { return false; }
+
+        uint32_t i = hops;
+        for (int v = sp[dst].prev; v != self; v = sp[v].prev) {
+            route[--i] = g->v[v].addr;
+        }
+    }
+    entry->reachable = true;
+    entry->route_len = (uint16_t) hops;
+    entry->route = route;
+    return true;
+}
+
+/**
+ * Rebuild the FIB from the topology. Our own row must be present, since it
+ * is the only source of our outgoing edges; until then nothing is reachable.
  */
 static void update_shortest_path(const struct mixnet_node_config *c,
                                  struct node_state *s) {
-    (void) c;
-    (void) s;
+
+    const struct graph *g = &s->topology;
+    if (!fib_reset(s, g->count)) { return; }
+
+    const int self = id_find(g, c->node_addr);
+    if (self < 0) { return; }
+
+    struct sp_vertex *sp = run_dijkstra(g, self);
+    if (sp == NULL) { return; }
+
+    for (uint16_t id = 0; id < g->count; id++) {
+        if (((int) id == self) || (sp[id].cost == INFINITE_COST)) { continue; }
+        if (!install_route(&s->fib[id], g, sp, self, (int) id)) {
+            DBG("[%u] no FIB entry for %u\n",
+                (unsigned) c->node_addr, (unsigned) g->v[id].addr);
+        }
+    }
+    free(sp);
+}
+
+/** The path to a destination, or NULL if the topology has none. */
+static const struct fib_entry *fib_lookup(const struct node_state *s,
+                                          const mixnet_address dst) {
+    const int id = id_find(&s->topology, dst);
+    if ((id < 0) || (id >= (int) s->fib_count) || !s->fib[id].reachable) {
+        return NULL;
+    }
+    return &s->fib[id];
 }
 
 /**
@@ -389,6 +574,10 @@ static bool state_init(const struct mixnet_node_config *c,
     s->topology.capacity = 0;
     s->lsa_start_ms = now_ms();
 
+    // The FIB follows the topology; see update_shortest_path()
+    s->fib = NULL;
+    s->fib_count = 0;
+
     return true;
 }
 
@@ -397,6 +586,8 @@ static void state_free(struct node_state *s) {
     free(s->blocked);
     s->neighbor_addr = NULL;
     s->blocked = NULL;
+
+    fib_reset(s, 0);
 
     for (uint16_t i = 0; i < s->topology.count; i++) {
         free(s->topology.v[i].links);
@@ -461,8 +652,14 @@ static void handle_stp(void *const handle,
         s->next_hop = pkt_addr;
         broadcast_stp(handle, c, s, -1);
     }
-    // Same root, same distance: a sibling, so this link is not a tree edge
-    else if ((pkt_root == s->root) && (s->path_len == pkt_path_len)) {
+    // Same root, and the sender is at least as close to it as we are, yet
+    // it is neither our parent nor worth switching to: a sibling at equal
+    // depth, or a node one hop closer that lost the parent tie-break to a
+    // smaller address. Either way this link is not a tree edge from our
+    // side. The second case only arises when a node has two neighbors one
+    // hop closer than itself (any even-length ring); leaving that port open
+    // keeps the ring cyclic and FLOOD/LSA traffic storms.
+    else if ((pkt_root == s->root) && (pkt_path_len <= s->path_len)) {
         s->blocked[port] = true;
     }
 
@@ -587,6 +784,197 @@ static void handle_lsa(void *const handle,
     free(packet);
 }
 
+/** The routing header of a DATA or PING packet, which leads the payload. */
+static mixnet_packet_routing_header *routing_header(
+        mixnet_packet *const packet) {
+    return (mixnet_packet_routing_header *) packet->payload;
+}
+
+/** The PING fields, which trail the routing header and its route. */
+static mixnet_packet_ping *ping_fields(mixnet_packet *const packet) {
+    const mixnet_packet_routing_header *rh = routing_header(packet);
+    return (mixnet_packet_ping *) (rh->route + rh->route_length);
+}
+
+/**
+ * Whether a DATA or PING packet's declared size covers everything we read
+ * from it: the routing header, the route it declares, and the PING fields.
+ * A PING fresh from the user has no PING fields yet, hence the flag.
+ */
+static bool routed_packet_is_well_formed(mixnet_packet *const packet,
+                                         const bool has_ping_fields) {
+
+    size_t needed = sizeof(mixnet_packet) + sizeof(mixnet_packet_routing_header);
+    if (packet->total_size < needed) { return false; }
+
+    needed += sizeof(mixnet_address) * routing_header(packet)->route_length;
+    if ((packet->type == PACKET_TYPE_PING) && has_ping_fields) {
+        needed += sizeof(mixnet_packet_ping);
+    }
+    return packet->total_size >= needed;
+}
+
+/**
+ * Send a routed packet to its next hop: the route entry the hop index points
+ * at, or the destination itself once the route is used up. Takes ownership
+ * of the packet.
+ */
+static void send_to_next_hop(void *const handle,
+                             const struct mixnet_node_config *c,
+                             const struct node_state *s,
+                             mixnet_packet *const packet) {
+
+    const mixnet_packet_routing_header *rh = routing_header(packet);
+    const mixnet_address next_hop = (rh->hop_index < rh->route_length) ?
+        rh->route[rh->hop_index] : rh->dst_address;
+
+    const int port = port_of(c, s, next_hop);
+    if (port < 0) {
+        DBG("[%u] dropped: next hop %u is not a neighbor\n",
+            (unsigned) c->node_addr, (unsigned) next_hop);
+        free(packet);
+        return;
+    }
+    send_packet(handle, (uint8_t) port, packet);
+}
+
+/**
+ * Source role. The user handed us a packet with source and destination set
+ * and no route. Look the destination up in the FIB, write the route into the
+ * header, and send toward the first hop.
+ *
+ * A DATA payload sits right after the header, where the route needs to go,
+ * so it moves down first; memmove, since the regions overlap. The framework
+ * allocates user packets at MAX_MIXNET_PACKET_SIZE, so there is room as long
+ * as the result is a legal packet. A PING from the user has no PING fields
+ * yet; those are appended here.
+ */
+static void source_route(void *const handle,
+                         const struct mixnet_node_config *c,
+                         const struct node_state *s,
+                         mixnet_packet *const packet) {
+
+    mixnet_packet_routing_header *rh = routing_header(packet);
+    const struct fib_entry *path = fib_lookup(s, rh->dst_address);
+    if (path == NULL) {
+        DBG("[%u] dropped: no route to %u\n",
+            (unsigned) c->node_addr, (unsigned) rh->dst_address);
+        free(packet);
+        return;
+    }
+
+    char *const old_tail = (char *) (rh->route + rh->route_length);
+    char *const new_tail = (char *) (rh->route + path->route_len);
+    const size_t tail_size = (packet->type == PACKET_TYPE_DATA) ?
+        (size_t) (((char *) packet + packet->total_size) - old_tail) :  // User's data
+        sizeof(mixnet_packet_ping);                                     // Added below
+
+    const size_t total_size = (size_t) (new_tail - (char *) packet) + tail_size;
+    if (total_size > MAX_MIXNET_PACKET_SIZE) {
+        DBG("[%u] dropped: %zu-byte packet to %u does not fit\n",
+            (unsigned) c->node_addr, total_size, (unsigned) rh->dst_address);
+        free(packet);
+        return;
+    }
+
+    if (packet->type == PACKET_TYPE_DATA) { memmove(new_tail, old_tail, tail_size); }
+    if (path->route_len > 0) {
+        memcpy(rh->route, path->route, sizeof(mixnet_address) * path->route_len);
+    }
+    rh->route_length = path->route_len;
+    rh->hop_index = 0;
+    packet->total_size = (uint16_t) total_size;
+
+    if (packet->type == PACKET_TYPE_PING) {
+        mixnet_packet_ping *ping = ping_fields(packet);
+        ping->is_request = true;
+        ping->_pad[0] = 0;
+        ping->send_time = now_ms();
+    }
+    send_to_next_hop(handle, c, s, packet);
+}
+
+/**
+ * A PING reply is the request sent back the way it came: source and
+ * destination swapped, route reversed, hop index restarted, and the request
+ * flag cleared so the reply is not itself answered.
+ */
+static mixnet_packet *make_ping_reply(const mixnet_packet *const request) {
+    mixnet_packet *reply = clone_packet(request);
+    if (reply == NULL) { return NULL; }
+
+    mixnet_packet_routing_header *rh = routing_header(reply);
+    const mixnet_address src = rh->src_address;
+    rh->src_address = rh->dst_address;
+    rh->dst_address = src;
+
+    for (uint16_t i = 0; i < (rh->route_length / 2); i++) {
+        const uint16_t j = (uint16_t) (rh->route_length - 1 - i);
+        const mixnet_address hop = rh->route[i];
+        rh->route[i] = rh->route[j];
+        rh->route[j] = hop;
+    }
+    rh->hop_index = 0;
+    ping_fields(reply)->is_request = false;
+    return reply;
+}
+
+/**
+ * DATA and PING receive path. The node plays one of three roles, decided by
+ * where the packet came from and whom it is for:
+ *
+ *   source:       from our user, so we choose the route;
+ *   destination:  addressed to us, so it goes up to our user, and a PING
+ *                 request also earns a reply;
+ *   forwarder:    anything else, so we advance the hop index and pass it on.
+ *
+ * Unlike FLOOD and LSA these may arrive over any link, blocked or not: the
+ * spanning tree constrains flooding only.
+ */
+static void handle_routed(void *const handle,
+                          const struct mixnet_node_config *c,
+                          const struct node_state *s, const uint8_t port,
+                          mixnet_packet *const packet) {
+
+    const uint8_t user_port = (uint8_t) c->num_neighbors;
+    const bool from_user = (port == user_port);
+
+    if (!routed_packet_is_well_formed(packet, !from_user)) {
+        DBG("[%u] %s dropped: bad total_size %u\n", (unsigned) c->node_addr,
+            (packet->type == PACKET_TYPE_PING) ? "PING" : "DATA",
+            (unsigned) packet->total_size);
+        free(packet);
+        return;
+    }
+    if (from_user) {
+        source_route(handle, c, s, packet);
+        return;
+    }
+
+    mixnet_packet_routing_header *rh = routing_header(packet);
+    if (rh->dst_address == c->node_addr) {
+        if ((packet->type == PACKET_TYPE_PING) && ping_fields(packet)->is_request) {
+            mixnet_packet *reply = make_ping_reply(packet);
+            if (reply != NULL) { send_to_next_hop(handle, c, s, reply); }
+        }
+        send_packet(handle, user_port, packet);
+        return;
+    }
+
+    // A forwarder is the hop the index points at; anything else is a packet
+    // that should never have reached us
+    if ((rh->hop_index >= rh->route_length) ||
+        (rh->route[rh->hop_index] != c->node_addr)) {
+        DBG("[%u] dropped: not hop %u of the route to %u\n",
+            (unsigned) c->node_addr, (unsigned) rh->hop_index,
+            (unsigned) rh->dst_address);
+        free(packet);
+        return;
+    }
+    rh->hop_index++;
+    send_to_next_hop(handle, c, s, packet);
+}
+
 /**
  * Runs on every iteration of the main loop, not only when a packet arrives:
  * a node whose neighbors have gone silent still has to send hellos and still
@@ -661,8 +1049,13 @@ void run_node(void *const handle,
                 handle_lsa(handle, &c, &s, port, packet);
                 break;
 
+            case PACKET_TYPE_DATA:
+            case PACKET_TYPE_PING:
+                handle_routed(handle, &c, &s, port, packet);
+                break;
+
             default:
-                // CP2 §2 does not route DATA/PING yet; drop them
+                // Unknown type; the framework never delivers one
                 free(packet);
                 break;
             }

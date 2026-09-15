@@ -165,7 +165,43 @@ def broadcast_lsa(ingress_port, packet):
   the piece to add if we ever handle topology changes.
 
 ## 2. Shortest Path Routing
-- TODO: Dijkstra over the adjacency list, FIB, source-routing the RH.
-- Notes so far: `dist` must be `uint32_t` (255 hops x cost 65535 overflows 16
-  bits); the equal-cost tie-break is on the *first hop out of the source*, not
-  the predecessor, so carry a `first_hop[]` alongside `dist[]` / `prev[]`.
+
+### FIB
+- The FIB is Dijkstra's output, kept between runs: one `fib_entry` per vertex, parallel to `graph.v`, holding `reachable`, `route_len`, and the intermediate hops in forwarding order.
+  That is exactly the form the routing header wants, so the source copies it in verbatim.
+- It is derived state.
+  `update_shortest_path()` rebuilds the whole table whenever `graph_update()` reports a change, and the data path only ever reads it.
+  There is no per-destination caching: a cached path is only valid for the map it was computed on, and the event that changes the map is the same event that would have to invalidate it.
+- `reachable` exists for the same reason `advertised` does.
+  A direct neighbor and an unreachable node both have `route == NULL`.
+
+### Dijkstra
+- Linear scan for the next vertex to settle, no heap.
+  The graph is at most a few hundred vertices, and the recompute runs a handful of times during the LSA burst and then stops, since byte-identical re-advertisements never reach it.
+- Each vertex's advertised row is its outgoing edges, so the graph is directed and asymmetric costs need nothing special.
+- Costs are `uint32_t`: 255 hops x 65535 overflows 16 bits.
+- The equal-cost tie-break is on the first hop out of the source, per the handout, not on the predecessor.
+  Each vertex therefore carries `first_hop` alongside `cost` and `prev`, inherited from the predecessor, or set to the neighbor itself when relaxing from us.
+  A path is better if it is cheaper, or equal and through a smaller first hop.
+- The same comparison decides the settling order, and that is required, not cosmetic.
+  Over a zero-cost link a vertex can be reached at equal cost from two unsettled predecessors with different first hops.
+  Settling by cost alone may settle it through the larger first hop before the smaller one has been examined, and a settled vertex is never revisited.
+  Settling by (cost, first hop) guarantees that every equal-cost path with a smaller first hop has already been relaxed by then.
+  `testcase_sp_zero_cost` is the regression test.
+- Our own row must be in the graph before anything is reachable, since it is the only source of our outgoing edges.
+  Until `originate_lsa()` installs it, the FIB is empty and user packets are dropped.
+
+### Data path
+- DATA and PING share one handler, `handle_routed()`, with three roles: source (arrived on the user port), destination (addressed to us), forwarder (everything else).
+- Source: FIB lookup, memmove the DATA payload down by the route's size, copy the route in, hop index 0.
+  User packets are allocated at `MAX_MIXNET_PACKET_SIZE`, so the move is safe as long as the result is a legal packet size, which is checked.
+  A PING from the user carries no PING fields at all (`total_size` is 20); the source appends them and stamps `send_time` in monotonic milliseconds.
+- Destination: up the user port.
+  A PING request is also cloned into a reply: src and dst swapped, route reversed, hop index 0, `is_request` false.
+  The reply follows the reversed route rather than a fresh FIB lookup, as the handout specifies.
+- Forwarder: we must be `route[hop_index]`, else drop.
+  Increment, then send to `route[hop_index]`, or to `dst` once the route is used up.
+- Routed packets may use any link, blocked or not.
+  The spanning tree constrains flooding only.
+- Every routed packet leaves through `send_to_next_hop()`, which is the seam for mixing.
+- Not done: mixing (`mixing_factor`) and random routing (`do_random_routing`).

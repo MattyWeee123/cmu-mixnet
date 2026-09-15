@@ -19,3 +19,4 @@ fi
 "${BIN_DIR}"/testcase_link_failure_root -a; echo;
 "${BIN_DIR}"/testcase_singleton -a; echo;
 "${BIN_DIR}"/testcase_reconverge_link_failure -a; echo;
+"${BIN_DIR}"/testcase_ring_even -a; echo;
