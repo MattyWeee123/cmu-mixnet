@@ -1,4 +1,4 @@
-# CP2 Plan - Link State Advertisement, Shortest Path Routing
+# CP2 Plan - Link State Advertisement, Shortest Path Routing, Mixing
 
 ## 1. Link State Advertisement
 
@@ -204,4 +204,204 @@ def broadcast_lsa(ingress_port, packet):
 - Routed packets may use any link, blocked or not.
   The spanning tree constrains flooding only.
 - Every routed packet leaves through `send_to_next_hop()`, which is the seam for mixing.
-- Not done: mixing (`mixing_factor`) and random routing (`do_random_routing`).
+- Mixing is §3 and random routing is §4; both are implemented and sit
+  behind this same seam.
+
+## 3. Mixing
+
+### The rule
+- A node collects exactly `mixing_factor` packets before sending any of them out
+  over the network, then releases the whole batch.
+  Collect k, send k - not collect k and release one.
+  Releasing one leaves a permanent backlog of k-1: the buffer refills to k on the
+  next arrival and drains to k-1 again, so the last k-1 packets of a run are never
+  delivered and `await_packet_propagation()` times out short.
+  It would also be a pure delay line - output order equals input order, so an
+  observer learns exactly what they would have learned without it.
+  The batch release *is* the mixing.
+- One budget per node, not one per port.
+  The handout counts packets "received from the user layer, a neighbor, or both"
+  against a single number, so there is a single buffer.
+- No timeout flush. "Exact number" means exact; see liveness below.
+
+### What gets mixed
+- DATA and PING, and only on their way *out over the network*.
+- Control packets bypass.
+  STP and LSA leave through `send_packet()` and `broadcast_on_tree()` and never
+  reach `send_to_next_hop()`, so they already sit outside the seam.
+  Keep it that way: a node that mixed its own hellos would stop refreshing the
+  tree while waiting on a batch that may never fill.
+- FLOOD is the genuinely ambiguous case.
+  `config.h` says "non-control", and the framework's user port accepts exactly
+  `{FLOOD, DATA, PING}`, which argues for including it.
+  Exclude it anyway: a FLOOD is replicated to every tree port, so "one packet" has
+  no single meaning for the count, and the handout introduces mixing purely to
+  hide *which pairs are communicating* - a question only source-routed traffic
+  raises. Revisit if a mixing test turns out to send FLOODs.
+- Packets addressed to us are never buffered; they go straight up the user port.
+  The user port is not "the network", and buffering them would break
+  `testcase_ping` outright - a destination receiving fewer than k packets would
+  never deliver even one.
+  So the count is just the number of network-bound packets we are holding.
+- A PING reply is generated locally rather than received, but it is network-bound,
+  so it enqueues like anything else.
+  The request it answers still goes up to the user immediately, unbuffered.
+
+### Buffer
+- The buffer never exceeds `mixing_factor` (at most 16), because we flush the
+  moment we reach it and a flush always drains to empty.
+  So: one flat array sized at startup, plus a count. No ring buffer, no head/tail
+  wraparound, no growth.
+
+```c
+struct mix_slot {
+    uint8_t port;               // Egress port, resolved before enqueueing
+    mixnet_packet *packet;      // Ours until it is flushed
+};
+
+// Added to struct node_state:
+struct mix_slot *mix;           // [mixing_factor], oldest first
+uint16_t mix_count;             // Held packets; always < mixing_factor between calls
+```
+
+- Resolve the egress port *before* enqueueing, not at flush time.
+  A packet whose next hop is not a neighbor is dropped today; enqueueing first
+  would let that drop silently eat a slot, leaving the node one short of a batch
+  forever.
+- `state_init()` allocates the array; `state_free()` frees the array *and* every
+  packet still held in it.
+  A node that ends a run mid-batch owns those packets and leaks them otherwise.
+
+### The seam
+- `send_to_next_hop()` is the only path from a routed packet to the wire, for all
+  three roles (source, forwarder, PING reply), so mixing goes there and nowhere
+  else.
+- It, `source_route()` and `handle_routed()` currently take
+  `const struct node_state *s`. The buffer is mutable state, so all three drop the
+  `const`.
+
+```c
+def send_to_next_hop(packet):           # takes ownership
+    rh = routing_header(packet)
+    next_hop = rh.route[rh.hop_index] if rh.hop_index < rh.route_length \
+                                      else rh.dst_address
+
+    port = port_of(next_hop)
+    if port < 0:
+        free(packet); return            # dropped before it can take a slot
+
+    if config.mixing_factor <= 1:       # 1 is the default
+        send_packet(port, packet)       # degenerates to today's behavior
+        return
+
+    s.mix[s.mix_count] = (port, packet)
+    s.mix_count += 1
+
+    if s.mix_count >= config.mixing_factor:
+        for (p, pkt) in s.mix[0 : s.mix_count]:
+            send_packet(p, pkt)         # FIFO; the framework takes ownership
+        s.mix_count = 0
+```
+
+- Test `>=`, not `==`, so a stray `mixing_factor` of 0 flushes immediately rather
+  than never.
+- Flush at enqueue time, inside this call, not on the `check_timers()` tick.
+  The batch is complete the moment the k'th packet arrives; deferring the send to
+  the next tick adds latency for nothing.
+- Order within a batch is FIFO.
+  The handout does not ask for a shuffle, and staying deterministic keeps routes
+  checkable in `pcap`.
+  The mixing comes from batching traffic from different links together, not from
+  permuting it.
+
+### Liveness
+- A node left holding fewer than `mixing_factor` packets holds them until the run
+  ends. That is the specified behavior, not a bug to paper over with a timer: do
+  not add a timeout flush, and check the test's arithmetic before debugging a
+  suspected hang here.
+- Consequence for our own tests: every mixing node must see a multiple of its
+  mixing factor.
+  Count the packets that actually *cross* each node, not the flows sent - a
+  forwarder that sits on two flows' shortest paths sees both.
+- That count is necessary but not sufficient: the packets also have to be able
+  to *reach* the node while it is waiting.
+  Two mixers in series, each needing a packet the other is holding, deadlock
+  even though both counts come out right.
+  `10 --- [20, k=2] --- 30 --- [40, k=2] --- 50` with flows 10->50 and 50->10
+  gives each mixer a count of 2 and delivers nothing: node 20 holds the
+  rightbound packet waiting for the leftbound one, which is sitting at node 40
+  waiting for the rightbound one. Running both flows in the same direction
+  fixes it, since then each mixer's batch is filled by packets that have
+  already got past every mixer upstream of it.
+  `testcase_mix_chain` is the working version, and says so in its comment.
+
+### Interaction with random routing
+- Orthogonal.
+  `do_random_routing` changes only which route `source_route()` writes into the
+  header; every packet still leaves through the same seam.
+  It does change *which* nodes see traffic, so the per-node counts above stop
+  being predictable once it is on - worth keeping the two features' tests apart.
+
+## 4. Random Routing
+
+### The rule
+- Only the source randomizes.
+  `do_random_routing` is per-node config and changes exactly one thing: which
+  route `source_route()` writes into the header. Forwarders follow the route
+  they are handed and never look at the flag.
+- The route is a detour through one random waypoint W, each leg a shortest
+  path: `src -> ... -> W -> ... -> dest`.
+- Revisiting a node is allowed and expected.
+
+### Choosing the waypoint
+- Draw W uniformly from the topology, excluding `src` and `dest`.
+
+### Building the route
+- The two legs come from different places.
+  `fib_lookup(s, W)` answers the first, because the FIB is rooted at this node.
+  It cannot answer the second: the FIB holds routes *from us*, so the W -> dest
+  leg needs its own `run_dijkstra(g, id_of(W))` plus an `install_route()`-style
+  walk of the predecessor chain to turn `struct sp_vertex *` into hops. That
+  array is freshly allocated and we free it; the FIB's array is not ours.
+- **W has to be spliced in between them.** Both legs exclude it.
+  A `fib_entry` route is "hops strictly between us and the destination", and
+  `install_route()` builds its array by walking `sp[dst].prev` back to `self`.
+  So W - the destination of the first leg, the root of the second - is in
+  neither. Concatenating the legs alone joins them at a node present in neither,
+  leaving a seam between two nodes that are not adjacent.
+
+```
+def generate_random_route(src, dest):       # hops only, excluding src and dest
+    eligible = [v for v in topology if v != src and v != dest]
+    if eligible is empty:
+        return fib_lookup(dest)             # 2-node topology, or barely converged
+
+    W = eligible[random(len(eligible))]
+
+    src_to_w = fib_lookup(W)                # strictly between src and W
+    if src_to_w is None:
+        return fib_lookup(dest)             # W not reachable yet
+
+    w_to_dest = shortest_path_from(W, dest) # own Dijkstra; strictly between
+    if w_to_dest is None:
+        return fib_lookup(dest)             # dest not reachable from W
+
+    route = src_to_w + [W] + w_to_dest      # the [W] is the whole trick
+    if len(route) > MAX_MIXNET_ROUTE_LENGTH:
+        return fib_lookup(dest)
+    return route
+```
+
+### The seam
+- `source_route()` is where this goes, and the only place.
+  Inside source_route(), check the config to see if random routing is to be used. 
+  If using random routing, use generate_random_route()
+
+### Fallbacks
+- Every failure falls back to the plain FIB route, the one
+  `do_random_routing == false` would have produced: empty eligible set, W
+  unreachable, dest unreachable from W, route over the cap.
+- A source that cannot build a detour should still deliver. Dropping the packet
+  instead would turn a converging topology into lost traffic, and the length
+  guard exists in `install_route()` already - not repeating it here would be the
+  inconsistency.

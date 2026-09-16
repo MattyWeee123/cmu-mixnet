@@ -13,8 +13,16 @@ if [ ! -d "${BIN_DIR}" ]; then
     exit 1
 fi
 
-"${BIN_DIR}"/testcase_sp_uniform_ring -a; echo;
-"${BIN_DIR}"/testcase_ping -a; echo;
-"${BIN_DIR}"/testcase_sp_weighted -a; echo;
-"${BIN_DIR}"/testcase_sp_tiebreak -a; echo;
-"${BIN_DIR}"/testcase_sp_zero_cost -a; echo;
+# Globbed rather than listed, so a new testcase*.cpp is picked up without
+# having to be added here too.
+status=0
+for test in "${BIN_DIR}"/testcase_*; do
+    [ -x "${test}" ] || continue
+    if ! "${test}" -a; then
+        status=1
+        echo "FAILED: $(basename "${test}")" >&2
+    fi
+    echo
+done
+
+exit "${status}"

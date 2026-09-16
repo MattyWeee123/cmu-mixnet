@@ -75,6 +75,17 @@ struct fib_entry {
 };
 
 /**
+ * One packet held back by mixing, waiting for its batch to fill. The egress
+ * port is resolved before the packet is enqueued, so that a packet with no
+ * route is dropped instead of occupying a slot the batch would then wait on
+ * forever.
+ */
+struct mix_slot {
+    uint8_t port;                   // Egress port, resolved at enqueue time
+    mixnet_packet *packet;          // Ours until the batch is flushed
+};
+
+/**
  * This node's protocol state.
  *
  * Spanning-tree invariant:
@@ -103,6 +114,10 @@ struct node_state {
     // Shortest paths (CP2)
     struct fib_entry *fib;          // [fib_count], parallel to topology.v
     uint16_t fib_count;             // topology.count as of the last rebuild
+
+    // Mixing (CP2)
+    struct mix_slot *mix;           // [mixing_factor], oldest first; NULL if unused
+    uint16_t mix_count;             // Held packets; always < mixing_factor here
 };
 
 /** Monotonic milliseconds; the STP intervals are in ms. */
@@ -578,6 +593,25 @@ static bool state_init(const struct mixnet_node_config *c,
     s->fib = NULL;
     s->fib_count = 0;
 
+    // Each node is a separate process, so rand() would otherwise start from
+    // the same state everywhere and every node would pick the same waypoints.
+    // Mixing the address in keeps nodes that start in the same millisecond
+    // apart. This is the only rand() user in our process.
+    srand((unsigned) (now_ms() ^ ((uint64_t) c->node_addr * 2654435761u)));
+
+    // Only a factor above 1 ever holds a packet back; 1 (the default) and 0
+    // both mean "send immediately", so they need no buffer. A flush always
+    // drains to empty, so the buffer never has to hold more than one batch.
+    s->mix = NULL;
+    s->mix_count = 0;
+    if (c->mixing_factor > 1) {
+        s->mix = malloc(sizeof(struct mix_slot) * c->mixing_factor);
+        if (s->mix == NULL) {
+            free(s->neighbor_addr);
+            free(s->blocked);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -586,6 +620,12 @@ static void state_free(struct node_state *s) {
     free(s->blocked);
     s->neighbor_addr = NULL;
     s->blocked = NULL;
+
+    // A node that ends the run mid-batch still owns those packets
+    for (uint16_t i = 0; i < s->mix_count; i++) { free(s->mix[i].packet); }
+    free(s->mix);
+    s->mix = NULL;
+    s->mix_count = 0;
 
     fib_reset(s, 0);
 
@@ -818,10 +858,21 @@ static bool routed_packet_is_well_formed(mixnet_packet *const packet,
  * Send a routed packet to its next hop: the route entry the hop index points
  * at, or the destination itself once the route is used up. Takes ownership
  * of the packet.
+ *
+ * This is the only path from a routed packet to the wire, for all three of
+ * the roles in handle_routed(), which is why mixing lives here and nowhere
+ * else. STP and LSA leave through send_packet() and broadcast_on_tree()
+ * instead, so control traffic bypasses mixing and keeps flowing while a
+ * batch fills; a packet addressed to us goes up the user port, which is not
+ * "the network", so it is not held back either.
+ *
+ * The batch release is the mixing: we collect exactly `mixing_factor`
+ * packets and then send all of them. Releasing one per arrival would instead
+ * leave a permanent backlog of k-1 and preserve input order exactly.
  */
 static void send_to_next_hop(void *const handle,
                              const struct mixnet_node_config *c,
-                             const struct node_state *s,
+                             struct node_state *s,
                              mixnet_packet *const packet) {
 
     const mixnet_packet_routing_header *rh = routing_header(packet);
@@ -835,7 +886,135 @@ static void send_to_next_hop(void *const handle,
         free(packet);
         return;
     }
-    send_packet(handle, (uint8_t) port, packet);
+    if (s->mix == NULL) {       // mixing_factor <= 1: today's behavior
+        send_packet(handle, (uint8_t) port, packet);
+        return;
+    }
+
+    s->mix[s->mix_count].port = (uint8_t) port;
+    s->mix[s->mix_count].packet = packet;
+    s->mix_count++;
+
+    // The batch is complete the moment the k'th packet arrives, so it goes
+    // out here rather than on the next check_timers() tick. Order within a
+    // batch is FIFO: the handout asks for batching, not a shuffle, and
+    // staying deterministic keeps routes checkable in pcap.
+    if (s->mix_count >= c->mixing_factor) {
+        DBG("[%u] mixing: releasing a batch of %u\n",
+            (unsigned) c->node_addr, (unsigned) s->mix_count);
+
+        for (uint16_t i = 0; i < s->mix_count; i++) {
+            send_packet(handle, s->mix[i].port, s->mix[i].packet);
+        }
+        s->mix_count = 0;
+    }
+}
+
+/**
+ * The hops strictly between two vertices on the shortest path out of `from`,
+ * written into `out`. Returns how many were written, or -1 if there is no
+ * path or it does not fit in `capacity`.
+ *
+ * install_route() does this for the FIB, but only ever rooted at us. Random
+ * routing needs a leg rooted at the waypoint, which is why this runs its own
+ * Dijkstra rather than reading s->fib.
+ */
+static int path_between(const struct graph *g, const int from, const int to,
+                        mixnet_address *const out, const uint16_t capacity) {
+
+    if (from == to) { return 0; }
+
+    struct sp_vertex *sp = run_dijkstra(g, from);
+    if (sp == NULL) { return -1; }
+
+    int written = -1;
+    if (sp[to].cost != INFINITE_COST) {
+        uint16_t hops = 0;
+        for (int v = sp[to].prev; v != from; v = sp[v].prev) { hops++; }
+
+        if (hops <= capacity) {
+            uint16_t i = hops;
+            for (int v = sp[to].prev; v != from; v = sp[v].prev) {
+                out[--i] = g->v[v].addr;
+            }
+            written = (int) hops;
+        }
+    }
+    free(sp);
+    return written;
+}
+
+/**
+ * A random detour to `dst`: the shortest path to a randomly chosen waypoint
+ * W, then W itself, then the shortest path from W onward. See the plan, §4.
+ *
+ * Returns the hops, owned by the caller, or NULL to mean "no detour, use the
+ * shortest path". Every failure takes that exit rather than dropping the
+ * packet: a source that cannot build a detour should still deliver.
+ *
+ * W is spliced in between the two legs because neither contains it. A
+ * fib_entry route is the hops strictly between us and its destination, and
+ * path_between() is the same, so concatenating the legs alone would join
+ * them at a node in neither and leave two non-adjacent hops in the middle.
+ * The packet would then be dropped by send_to_next_hop(), silently.
+ */
+static mixnet_address *random_route(const struct mixnet_node_config *c,
+                                    const struct node_state *s,
+                                    const mixnet_address dst,
+                                    uint16_t *const len_out) {
+
+    const struct graph *g = &s->topology;
+
+    // Eligible waypoints are the vertices that are neither endpoint. Both
+    // endpoints reduce to the shortest path, so allowing them would just be
+    // a slower way of not randomizing. Counted and then scanned to, so there
+    // is no candidate array to allocate per packet.
+    uint16_t eligible = 0;
+    for (uint16_t i = 0; i < g->count; i++) {
+        if ((g->v[i].addr != c->node_addr) && (g->v[i].addr != dst)) { eligible++; }
+    }
+    if (eligible == 0) { return NULL; }   // Two-node topology, or barely converged
+
+    uint16_t k = (uint16_t) (rand() % eligible);
+    int wid = -1;
+    for (uint16_t i = 0; i < g->count; i++) {
+        if ((g->v[i].addr == c->node_addr) || (g->v[i].addr == dst)) { continue; }
+        if (k == 0) { wid = (int) i; break; }
+        k--;
+    }
+    if (wid < 0) { return NULL; }         // Cannot happen: the scan mirrors the count
+
+    const mixnet_address w = g->v[wid].addr;
+    const int did = id_find(g, dst);
+    if (did < 0) { return NULL; }
+
+    // First leg: the FIB is rooted here, so it already knows src -> W
+    const struct fib_entry *src_to_w = fib_lookup(s, w);
+    if (src_to_w == NULL) { return NULL; }              // W not reachable yet
+
+    // install_route() allows a route of exactly MAX_MIXNET_ROUTE_LENGTH, so
+    // this rejects only what genuinely cannot be carried, W included.
+    const uint16_t head = src_to_w->route_len;
+    if ((head + 1) > MAX_MIXNET_ROUTE_LENGTH) { return NULL; }
+
+    mixnet_address *route = malloc(sizeof(*route) * MAX_MIXNET_ROUTE_LENGTH);
+    if (route == NULL) { return NULL; }
+
+    if (head > 0) { memcpy(route, src_to_w->route, sizeof(*route) * head); }
+    route[head] = w;                                    // The splice
+
+    // Second leg, rooted at W, which the FIB cannot answer
+    const int tail = path_between(g, wid, did, route + head + 1,
+                                  (uint16_t) (MAX_MIXNET_ROUTE_LENGTH - head - 1));
+    if (tail < 0) {                                     // Unreachable, or too long
+        free(route);
+        return NULL;
+    }
+    *len_out = (uint16_t) (head + 1 + tail);
+    DBG("[%u] random route to %u via %u: %u hops\n", (unsigned) c->node_addr,
+        (unsigned) dst, (unsigned) w, (unsigned) *len_out);
+
+    return route;
 }
 
 /**
@@ -851,7 +1030,7 @@ static void send_to_next_hop(void *const handle,
  */
 static void source_route(void *const handle,
                          const struct mixnet_node_config *c,
-                         const struct node_state *s,
+                         struct node_state *s,
                          mixnet_packet *const packet) {
 
     mixnet_packet_routing_header *rh = routing_header(packet);
@@ -863,8 +1042,23 @@ static void source_route(void *const handle,
         return;
     }
 
+    // The shortest path, unless this node randomizes and a detour could be
+    // built. random_route() returns NULL to mean "use the FIB" (§4).
+    const mixnet_address *route = path->route;
+    uint16_t route_len = path->route_len;
+    mixnet_address *detour = NULL;
+
+    if (c->do_random_routing) {
+        uint16_t detour_len = 0;
+        detour = random_route(c, s, rh->dst_address, &detour_len);
+        if (detour != NULL) {
+            route = detour;
+            route_len = detour_len;
+        }
+    }
+
     char *const old_tail = (char *) (rh->route + rh->route_length);
-    char *const new_tail = (char *) (rh->route + path->route_len);
+    char *const new_tail = (char *) (rh->route + route_len);
     const size_t tail_size = (packet->type == PACKET_TYPE_DATA) ?
         (size_t) (((char *) packet + packet->total_size) - old_tail) :  // User's data
         sizeof(mixnet_packet_ping);                                     // Added below
@@ -873,15 +1067,18 @@ static void source_route(void *const handle,
     if (total_size > MAX_MIXNET_PACKET_SIZE) {
         DBG("[%u] dropped: %zu-byte packet to %u does not fit\n",
             (unsigned) c->node_addr, total_size, (unsigned) rh->dst_address);
+        free(detour);
         free(packet);
         return;
     }
 
     if (packet->type == PACKET_TYPE_DATA) { memmove(new_tail, old_tail, tail_size); }
-    if (path->route_len > 0) {
-        memcpy(rh->route, path->route, sizeof(mixnet_address) * path->route_len);
+    if (route_len > 0) {
+        memcpy(rh->route, route, sizeof(mixnet_address) * route_len);
     }
-    rh->route_length = path->route_len;
+    free(detour);           // Copied into the header; `route` dangles past here
+
+    rh->route_length = route_len;
     rh->hop_index = 0;
     packet->total_size = (uint16_t) total_size;
 
@@ -933,7 +1130,7 @@ static mixnet_packet *make_ping_reply(const mixnet_packet *const request) {
  */
 static void handle_routed(void *const handle,
                           const struct mixnet_node_config *c,
-                          const struct node_state *s, const uint8_t port,
+                          struct node_state *s, const uint8_t port,
                           mixnet_packet *const packet) {
 
     const uint8_t user_port = (uint8_t) c->num_neighbors;
